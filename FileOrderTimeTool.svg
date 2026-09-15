@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="950" height="950" viewBox="0 0 950 950">
+  <defs>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#fafafa"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#087cf7"/>
+      <stop offset="1" stop-color="#006be9"/>
+    </linearGradient>
+    <filter id="soft-edge" x="-8%" y="-8%" width="116%" height="116%">
+      <feDropShadow dx="0" dy="1" stdDeviation="2.5" flood-color="#101821" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <!-- Rounded application tile. Outside the tile remains transparent. -->
+  <rect x="1" y="1" width="948" height="948" rx="184" ry="184"
+        fill="#313131" stroke="#111111" stroke-width="2"/>
+
+  <!-- Three files, drawn back to front. -->
+  <g fill="url(#paper)" stroke="#1c2530" stroke-width="16"
+     stroke-linecap="round" stroke-linejoin="round" filter="url(#soft-edge)">
+    <path d="M297 120 H589 L676 207 V592 Q676 610 658 610 H297 Q280 610 280 592 V138 Q280 120 297 120 Z"/>
+    <path d="M589 120 V188 Q589 207 608 207 H676" fill="none"/>
+
+    <path d="M375 220 H666 L753 307 V694 Q753 711 736 711 H375 Q358 711 358 694 V237 Q358 220 375 220 Z"/>
+    <path d="M666 220 V288 Q666 307 685 307 H753" fill="none"/>
+
+    <path d="M453 320 H744 L831 407 V794 Q831 811 814 811 H453 Q436 811 436 794 V337 Q436 320 453 320 Z"/>
+    <path d="M744 320 V388 Q744 407 763 407 H831" fill="none"/>
+  </g>
+
+  <!-- Batch-order arrow, positioned to balance the file stack. -->
+  <path d="M181 379
+           C162 379 149 393 149 411
+           V698 H114
+           C106 698 102 707 107 714
+           L174 816
+           C178 823 185 823 189 816
+           L255 714
+           C260 707 256 698 248 698
+           H213 V411
+           C213 393 200 379 181 379 Z"
+        fill="url(#blue)" stroke="#1c2530" stroke-width="15"
+        stroke-linejoin="round" filter="url(#soft-edge)"/>
+</svg>

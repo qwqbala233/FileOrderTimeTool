@@ -13,8 +13,8 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
-[assembly: System.Reflection.AssemblyVersion("1.8.4.4")]
-[assembly: System.Reflection.AssemblyFileVersion("1.8.4.4")]
+[assembly: System.Reflection.AssemblyVersion("1.8.4.5")]
+[assembly: System.Reflection.AssemblyFileVersion("1.8.4.5")]
 
 namespace FileOrderTimeTool
 {
@@ -1112,7 +1112,7 @@ namespace FileOrderTimeTool
 
             Color fill = Enabled && !inactive ? (pressed ? SystemColors.ControlLight : SystemColors.Window) : SystemColors.Control;
             using (Brush brush = new SolidBrush(fill)) e.Graphics.FillRectangle(brush, bounds);
-            ControlPaint.DrawBorder(e.Graphics, bounds, Enabled && !inactive ? SystemColors.ControlDark : SystemColors.InactiveBorder,
+            ControlPaint.DrawBorder(e.Graphics, bounds, Enabled && !inactive ? SystemColors.ControlDark : Color.FromArgb(171, 173, 179),
                 ButtonBorderStyle.Solid);
 
             int inset = Math.Max(4, (int)Math.Round(Ui.InputLeftInset * e.Graphics.DpiX / 96f));
@@ -1371,7 +1371,7 @@ namespace FileOrderTimeTool
             if (bounds.Width <= 1 || bounds.Height <= 1) return;
             using (Brush brush = new SolidBrush(Enabled && !inactive ? (pressed ? SystemColors.ControlLight : SystemColors.Window) : SystemColors.Control))
                 e.Graphics.FillRectangle(brush, bounds);
-            ControlPaint.DrawBorder(e.Graphics, bounds, Enabled && !inactive ? SystemColors.ControlDark : SystemColors.InactiveBorder, ButtonBorderStyle.Solid);
+            ControlPaint.DrawBorder(e.Graphics, bounds, Enabled && !inactive ? SystemColors.ControlDark : Color.FromArgb(171, 173, 179), ButtonBorderStyle.Solid);
             int inset = Math.Max(4, (int)Math.Round(Ui.InputLeftInset * e.Graphics.DpiX / 96f));
             Rectangle textBounds = new Rectangle(inset, 1, Math.Max(0, Width - inset - ArrowArea), Height - 2);
             TextRenderer.DrawText(e.Graphics, DisplayText, Font, textBounds, Enabled ? ForeColor : SystemColors.GrayText,
@@ -2383,13 +2383,13 @@ namespace FileOrderTimeTool
             btnRedo.Enabled = history.CanRedo;
             btnUndoDisk.Enabled = diskHistory.CanUndo;
             btnRedoDisk.Enabled = diskHistory.CanRedo;
-            btnDateMode.Enabled = true;
-            btnDateMode.Inactive = !dateEnabled;
-            latestDateSelector.Enabled = true;
-            latestDateSelector.Inactive = !dateEnabled;
+            btnDateMode.Inactive = false;
+            btnDateMode.Enabled = dateEnabled;
+            latestDateSelector.Inactive = false;
+            latestDateSelector.Enabled = dateEnabled;
             numInterval.Enabled = dateEnabled;
-            btnUnit.Enabled = true;
-            btnUnit.Inactive = !dateEnabled;
+            btnUnit.Inactive = false;
+            btnUnit.Enabled = dateEnabled;
             lblDateModeTitle.ForeColor = SystemColors.ControlText;
             lblLatestDateTitle.ForeColor = SystemColors.ControlText;
             lblIntervalTitle.ForeColor = SystemColors.ControlText;
@@ -3202,7 +3202,7 @@ namespace FileOrderTimeTool
 
         public HelpForm()
         {
-            Text = "使用说明 - 批量文件排序/重命名工具 v1.8.4.4 测试版";
+            Text = "使用说明 - 批量文件排序/重命名工具 v1.8.4.5 测试版";
             ClientSize = new Size(760, 540);
             MinimumSize = new Size(620, 440);
             StartPosition = FormStartPosition.CenterParent;

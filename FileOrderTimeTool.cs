@@ -9,12 +9,13 @@ using System.IO;
 using System.Linq;
 using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
-[assembly: System.Reflection.AssemblyVersion("1.8.4.5")]
-[assembly: System.Reflection.AssemblyFileVersion("1.8.4.5")]
+[assembly: System.Reflection.AssemblyVersion("1.8.5.3")]
+[assembly: System.Reflection.AssemblyFileVersion("1.8.5.3")]
 
 namespace FileOrderTimeTool
 {
@@ -347,6 +348,8 @@ namespace FileOrderTimeTool
         public const string RedoDisk = "RedoDisk";
         public const string MoveLeft = "MoveLeft";
         public const string MoveRight = "MoveRight";
+        public const string MoveUp = "MoveUp";
+        public const string MoveDown = "MoveDown";
         public const string MoveFront = "MoveFront";
         public const string MoveEnd = "MoveEnd";
         public const string PrevSort = "PrevSort";
@@ -355,7 +358,7 @@ namespace FileOrderTimeTool
         public const string NextDirection = "NextDirection";
         public const string Help = "Help";
 
-        public static readonly string[] Order = new string[] { Remove, Sort, Undo, Redo, Preview, Apply, UndoDisk, RedoDisk, MoveLeft, MoveRight, MoveFront, MoveEnd, PrevSort, NextSort, PrevDirection, NextDirection, Help };
+        public static readonly string[] Order = new string[] { Remove, Sort, Undo, Redo, Preview, Apply, UndoDisk, RedoDisk, MoveLeft, MoveRight, MoveUp, MoveDown, MoveFront, MoveEnd, PrevSort, NextSort, PrevDirection, NextDirection, Help };
         public static string Title(string id)
         {
             if (id == Remove) return "移除";
@@ -368,6 +371,8 @@ namespace FileOrderTimeTool
             if (id == RedoDisk) return "重做更改";
             if (id == MoveLeft) return "向左移动";
             if (id == MoveRight) return "向右移动";
+            if (id == MoveUp) return "上移一行";
+            if (id == MoveDown) return "下移一行";
             if (id == MoveFront) return "移到最前";
             if (id == MoveEnd) return "移到最后";
             if (id == PrevSort) return "上一个排序方式";
@@ -390,8 +395,10 @@ namespace FileOrderTimeTool
             d[RedoDisk] = B(Keys.Z, Keys.Control | Keys.Shift | Keys.Alt);
             d[MoveLeft] = B(Keys.Left);
             d[MoveRight] = B(Keys.Right);
-            d[MoveFront] = B(Keys.Up);
-            d[MoveEnd] = B(Keys.Down);
+            d[MoveUp] = B(Keys.Up);
+            d[MoveDown] = B(Keys.Down);
+            d[MoveFront] = B(Keys.Up, Keys.Control);
+            d[MoveEnd] = B(Keys.Down, Keys.Control);
             d[PrevSort] = B(Keys.Up, Keys.None, true);
             d[NextSort] = B(Keys.Down, Keys.None, true);
             d[PrevDirection] = B(Keys.Up, Keys.Control, true);
@@ -433,6 +440,37 @@ namespace FileOrderTimeTool
             hoverIndex = -1;
             itemToolTip.SetToolTip(this, null);
             Invalidate();
+            // ScrollableControl may defer WM_PAINT while the scrollbar thumb is held.
+            // Force the file grid to follow every thumb-track message instead of
+            // visually jumping only after the mouse button is released.
+            if (se.Type == ScrollEventType.ThumbTrack || se.Type == ScrollEventType.ThumbPosition) Update();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == NativeMethods.WM_MOUSEWHEEL && externalFileDrag)
+            {
+                int delta = unchecked((short)((long)m.WParam >> 16));
+                if (delta != 0)
+                {
+                    ScrollByWheel(delta > 0 ? -1 : 1);
+                    m.Result = IntPtr.Zero;
+                    return;
+                }
+            }
+
+            bool trackingThumb = m.Msg == NativeMethods.WM_VSCROLL &&
+                (((int)(long)m.WParam) & 0xFFFF) == NativeMethods.SB_THUMBTRACK;
+            int packedTrackPosition = trackingThumb ? (int)(((long)m.WParam >> 16) & 0xFFFF) : 0;
+            base.WndProc(ref m);
+            if (trackingThumb)
+            {
+                int nativeTrackPosition;
+                int position = NativeMethods.TryGetVerticalTrackPosition(Handle, out nativeTrackPosition) &&
+                    (nativeTrackPosition != 0 || packedTrackPosition == 0)
+                    ? nativeTrackPosition : packedTrackPosition;
+                SetVerticalScrollPosition(position, true);
+            }
         }
         private int anchorIndex = -1;
         private bool mouseDown;
@@ -442,11 +480,23 @@ namespace FileOrderTimeTool
         private int insertionIndex = -1;
         private bool marquee;
         private Rectangle marqueeRect;
+        private Point marqueeStartContent;
         private HashSet<FileItem> marqueeBase = new HashSet<FileItem>();
         private bool collapseOnMouseUp;
         private readonly ToolTip itemToolTip = new ToolTip();
+        private readonly System.Windows.Forms.Timer dragScrollTimer = new System.Windows.Forms.Timer();
+        private bool externalFileDrag;
+        private readonly NativeMethods.LowLevelMouseProc externalDragWheelHookProc;
+        private IntPtr externalDragWheelHook;
         private int hoverIndex = -1;
         public event Action<int> ItemOpenRequested;
+
+        private sealed class ExternalDropEntry
+        {
+            public string Path;
+            public Point Position;
+            public int SourceIndex;
+        }
 
         public FileCanvas()
         {
@@ -460,15 +510,31 @@ namespace FileOrderTimeTool
             itemToolTip.ReshowDelay = 250;
             itemToolTip.AutoPopDelay = 6000;
             itemToolTip.ShowAlways = true;
+            dragScrollTimer.Interval = 45;
+            dragScrollTimer.Tick += delegate { ContinueDragAutoScroll(); };
+            externalDragWheelHookProc = ExternalDragWheelHookCallback;
+            Disposed += delegate
+            {
+                dragScrollTimer.Stop();
+                dragScrollTimer.Dispose();
+                EndExternalFileDrag();
+            };
         }
+
+        public bool ExternalFileDragActive { get { return externalFileDrag; } }
 
         public int SelectedCount { get { return Items.Count(x => x.Selected); } }
         public List<FileItem> SelectedItemsInOrder { get { return Items.Where(x => x.Selected).ToList(); } }
 
         public void AddFiles(IEnumerable<string> paths)
         {
+            AddFilesAt(paths, Items.Count);
+        }
+
+        private void AddFilesAt(IEnumerable<string> paths, int insertion)
+        {
             HashSet<string> existing = new HashSet<string>(Items.Select(x => SafeFullPath(x.Path)), StringComparer.OrdinalIgnoreCase);
-            int added = 0;
+            List<FileItem> added = new List<FileItem>();
             foreach (string raw in paths)
             {
                 try
@@ -478,15 +544,16 @@ namespace FileOrderTimeTool
                     string full = SafeFullPath(raw);
                     if (existing.Contains(full)) continue;
                     FileItem item = new FileItem { Path = full };
-                    Items.Add(item);
+                    added.Add(item);
                     existing.Add(full);
-                    added++;
                     QueueThumbnail(item);
                 }
                 catch { }
             }
-            if (added > 0)
+            if (added.Count > 0)
             {
+                int target = Math.Max(0, Math.Min(Items.Count, insertion));
+                Items.InsertRange(target, added);
                 UpdateScrollSize();
                 Invalidate();
                 RaiseOrderChanged();
@@ -547,13 +614,57 @@ namespace FileOrderTimeTool
             }
             if (first < 0) return;
             int target;
-            if (left) target = Math.Max(0, first - 1);
-            else target = Math.Min(remaining.Count, last);
+            if (left)
+            {
+                if (first == 0) return;
+                target = first - 1;
+            }
+            else
+            {
+                int unselectedThroughSpan = last + 1 - selected.Count;
+                if (unselectedThroughSpan >= remaining.Count) return;
+                target = unselectedThroughSpan + 1;
+            }
             remaining.InsertRange(target, selected);
             if (!SameOrder(before, remaining))
             {
                 SetOrder(remaining);
                 if (History != null) History.Push(new OrderAction(this, before, remaining, left ? "向左移动" : "向右移动"));
+            }
+        }
+
+        public void MoveSelectedRow(bool up)
+        {
+            if (SelectedCount == 0 || Items.Count <= 1) return;
+            List<FileItem> before = new List<FileItem>(Items);
+            List<FileItem> selected = Items.Where(x => x.Selected).ToList();
+            List<FileItem> remaining = Items.Where(x => !x.Selected).ToList();
+            int first = -1, last = -1;
+            for (int i = 0; i < Items.Count; i++)
+            {
+                if (!Items[i].Selected) continue;
+                if (first < 0) first = i;
+                last = i;
+            }
+            if (first < 0) return;
+
+            int columns = Math.Max(1, Columns);
+            int target;
+            if (up)
+            {
+                if (first < columns) return;
+                target = Math.Max(0, first - columns);
+            }
+            else
+            {
+                int unselectedThroughSpan = last + 1 - selected.Count;
+                target = Math.Min(remaining.Count, unselectedThroughSpan + columns);
+            }
+            remaining.InsertRange(target, selected);
+            if (!SameOrder(before, remaining))
+            {
+                SetOrder(remaining);
+                if (History != null) History.Push(new OrderAction(this, before, remaining, up ? "上移一行" : "下移一行"));
             }
         }
 
@@ -609,7 +720,7 @@ namespace FileOrderTimeTool
 
             for (int i = 0; i < Items.Count; i++) DrawItem(e.Graphics, i, Items[i]);
 
-            if (draggingItems && insertionIndex >= 0)
+            if ((draggingItems || externalFileDrag) && insertionIndex >= 0)
             {
                 Rectangle slot = GetSlotRect(insertionIndex);
                 using (Pen p = new Pen(Color.FromArgb(0, 120, 215), 3))
@@ -815,6 +926,7 @@ namespace FileOrderTimeTool
             {
                 marquee = true;
                 Point cp = ClientToContent(e.Location);
+                marqueeStartContent = cp;
                 marqueeRect = new Rectangle(cp, Size.Empty);
                 marqueeBase = ctrl ? new HashSet<FileItem>(Items.Where(x => x.Selected)) : new HashSet<FileItem>();
                 if (!ctrl)
@@ -823,6 +935,7 @@ namespace FileOrderTimeTool
                     RaiseSelectionChanged();
                     Invalidate();
                 }
+                UpdateDragScrollTimer();
             }
         }
 
@@ -833,14 +946,7 @@ namespace FileOrderTimeTool
             if (!mouseDown || e.Button != MouseButtons.Left) return;
             if (marquee)
             {
-                Point a = ClientToContent(mouseDownPoint);
-                Point b = ClientToContent(e.Location);
-                marqueeRect = NormalizeRect(a, b);
-                foreach (FileItem x in Items) x.Selected = marqueeBase.Contains(x);
-                for (int i = 0; i < Items.Count; i++)
-                    if (marqueeRect.IntersectsWith(GetItemRect(i))) Items[i].Selected = true;
-                RaiseSelectionChanged();
-                Invalidate();
+                UpdateMarqueeSelection(e.Location);
                 return;
             }
 
@@ -850,14 +956,25 @@ namespace FileOrderTimeTool
                 {
                     draggingItems = true;
                     collapseOnMouseUp = false;
+                    UpdateDragScrollTimer();
                 }
                 if (draggingItems)
                 {
                     insertionIndex = InsertionFromPoint(e.Location);
                     Invalidate();
-                    AutoScrollNearEdge(e.Location);
                 }
             }
+        }
+
+        private void UpdateMarqueeSelection(Point clientPoint)
+        {
+            Point b = ClientToContent(clientPoint);
+            marqueeRect = NormalizeRect(marqueeStartContent, b);
+            foreach (FileItem x in Items) x.Selected = marqueeBase.Contains(x);
+            for (int i = 0; i < Items.Count; i++)
+                if (marqueeRect.IntersectsWith(GetItemRect(i))) Items[i].Selected = true;
+            RaiseSelectionChanged();
+            Invalidate();
         }
 
         private void UpdateHoverTooltip(Point location)
@@ -909,6 +1026,7 @@ namespace FileOrderTimeTool
             insertionIndex = -1;
             marquee = false;
             collapseOnMouseUp = false;
+            UpdateDragScrollTimer();
             Invalidate();
         }
 
@@ -935,30 +1053,288 @@ namespace FileOrderTimeTool
         protected override void OnDragEnter(DragEventArgs drgevent)
         {
             base.OnDragEnter(drgevent);
-            if (drgevent.Data != null && drgevent.Data.GetDataPresent(DataFormats.FileDrop)) drgevent.Effect = DragDropEffects.Copy;
+            if (drgevent.Data != null && drgevent.Data.GetDataPresent(DataFormats.FileDrop))
+            {
+                drgevent.Effect = DragDropEffects.Copy;
+                BeginExternalFileDrag();
+                Point p = PointToClient(new Point(drgevent.X, drgevent.Y));
+                insertionIndex = InsertionFromPoint(p);
+                UpdateDragScrollTimer();
+                Invalidate();
+            }
         }
 
         protected override void OnDragOver(DragEventArgs drgevent)
         {
             base.OnDragOver(drgevent);
-            if (drgevent.Data != null && drgevent.Data.GetDataPresent(DataFormats.FileDrop)) drgevent.Effect = DragDropEffects.Copy;
+            if (drgevent.Data != null && drgevent.Data.GetDataPresent(DataFormats.FileDrop))
+            {
+                drgevent.Effect = DragDropEffects.Copy;
+                BeginExternalFileDrag();
+                Point p = PointToClient(new Point(drgevent.X, drgevent.Y));
+                insertionIndex = InsertionFromPoint(p);
+                UpdateDragScrollTimer();
+                Invalidate();
+            }
+            else drgevent.Effect = DragDropEffects.None;
+        }
+
+        protected override void OnDragLeave(EventArgs e)
+        {
+            base.OnDragLeave(e);
+            // OLE reports DragLeave as soon as the pointer crosses from the file
+            // canvas into the bottom controls. Keep the drag session alive so the
+            // timer can continue scrolling while the left button remains held.
+            UpdateDragScrollTimer();
+            Invalidate();
         }
 
         protected override void OnDragDrop(DragEventArgs drgevent)
         {
             base.OnDragDrop(drgevent);
             if (drgevent.Data == null || !drgevent.Data.GetDataPresent(DataFormats.FileDrop)) return;
-            string[] files = drgevent.Data.GetData(DataFormats.FileDrop) as string[];
-            if (files != null) AddFiles(files);
+            string[] files = GetExternalFilesInViewOrder(drgevent.Data);
+            Point dropPoint = PointToClient(new Point(drgevent.X, drgevent.Y));
+            int target = InsertionFromPoint(dropPoint);
+            EndExternalFileDrag();
+            insertionIndex = -1;
+            UpdateDragScrollTimer();
+            if (files != null) AddFilesAt(files, target);
+            Invalidate();
         }
 
-        private void AutoScrollNearEdge(Point p)
+        private static string[] GetExternalFilesInViewOrder(System.Windows.Forms.IDataObject data)
         {
-            if (!AutoScroll) return;
-            int y = -AutoScrollPosition.Y;
-            if (p.Y < 30) y = Math.Max(0, y - 24);
-            else if (p.Y > ClientSize.Height - 30) y += 24;
-            AutoScrollPosition = new Point(-AutoScrollPosition.X, y);
+            if (data == null) return null;
+            string[] files = data.GetData(DataFormats.FileDrop) as string[];
+            if (files == null || files.Length < 2) return files;
+
+            string[] viewOrder = ExplorerSelectionOrder.TryGetViewOrder(files);
+            if (viewOrder != null) return viewOrder;
+
+            List<Point> positions;
+            if (!TryReadShellObjectOffsets(data, files.Length, out positions))
+                return RestoreCyclicNaturalNameOrder(files);
+
+            // Explorer moves the file grabbed with the mouse to the beginning of
+            // CF_HDROP, followed by the remaining selection as a cyclic sequence.
+            // Shell Object Offsets identifies the selection's visual first item.
+            // Rotating at that point restores Explorer's own order without
+            // re-sorting files that Explorer displayed by date, size, and so on.
+            List<ExternalDropEntry> entries = files.Select((path, index) => new ExternalDropEntry
+                {
+                    Path = path,
+                    Position = positions[index],
+                    SourceIndex = index
+                })
+                .ToList();
+            int firstIndex = entries
+                .OrderBy(entry => entry.Position.Y)
+                .ThenBy(entry => entry.Position.X)
+                .ThenBy(entry => entry.SourceIndex)
+                .First().SourceIndex;
+            if (firstIndex == 0) return files;
+            return files.Skip(firstIndex).Concat(files.Take(firstIndex)).ToArray();
+        }
+
+        private static string[] RestoreCyclicNaturalNameOrder(string[] files)
+        {
+            if (files == null || files.Length < 2) return files;
+            string[] ascending = files.ToArray();
+            Array.Sort(ascending, delegate(string a, string b)
+            {
+                int result = NativeMethods.NaturalCompare(System.IO.Path.GetFileName(a), System.IO.Path.GetFileName(b));
+                return result != 0 ? result : string.Compare(a, b, StringComparison.OrdinalIgnoreCase);
+            });
+            if (IsCyclicOrder(files, ascending)) return ascending;
+
+            string[] descending = ascending.Reverse().ToArray();
+            if (IsCyclicOrder(files, descending)) return descending;
+            return files;
+        }
+
+        private static bool IsCyclicOrder(string[] source, string[] expected)
+        {
+            if (source == null || expected == null || source.Length != expected.Length || source.Length == 0) return false;
+            int first = Array.FindIndex(source, path => string.Equals(path, expected[0], StringComparison.OrdinalIgnoreCase));
+            if (first < 0) return false;
+            for (int i = 0; i < source.Length; i++)
+            {
+                if (!string.Equals(source[(first + i) % source.Length], expected[i], StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            return true;
+        }
+
+        private static bool TryReadShellObjectOffsets(System.Windows.Forms.IDataObject data, int fileCount, out List<Point> positions)
+        {
+            positions = null;
+            const string format = "Shell Object Offsets";
+            try
+            {
+                string actualFormat = data.GetFormats(false).FirstOrDefault(value => string.Equals(value, format, StringComparison.OrdinalIgnoreCase));
+                if (actualFormat == null)
+                    actualFormat = data.GetFormats(true).FirstOrDefault(value => string.Equals(value, format, StringComparison.OrdinalIgnoreCase));
+                if (actualFormat == null) return false;
+                object raw = data.GetData(actualFormat, false) ?? data.GetData(actualFormat, true);
+                byte[] bytes = raw as byte[];
+                if (bytes == null)
+                {
+                    Stream stream = raw as Stream;
+                    if (stream == null) return false;
+                    long originalPosition = stream.CanSeek ? stream.Position : 0;
+                    if (stream.CanSeek) stream.Position = 0;
+                    using (MemoryStream copy = new MemoryStream())
+                    {
+                        stream.CopyTo(copy);
+                        bytes = copy.ToArray();
+                    }
+                    if (stream.CanSeek) stream.Position = originalPosition;
+                }
+
+                // The first POINT is the group's origin. The following POINTs
+                // correspond one-for-one with the paths in CF_HDROP.
+                int required = checked((fileCount + 1) * 8);
+                if (bytes.Length < required) return false;
+                positions = new List<Point>(fileCount);
+                for (int i = 0; i < fileCount; i++)
+                {
+                    int offset = (i + 1) * 8;
+                    positions.Add(new Point(BitConverter.ToInt32(bytes, offset), BitConverter.ToInt32(bytes, offset + 4)));
+                }
+                return positions.Distinct().Count() > 1;
+            }
+            catch
+            {
+                positions = null;
+                return false;
+            }
+        }
+
+        private void UpdateDragScrollTimer()
+        {
+            if (draggingItems || marquee || externalFileDrag)
+            {
+                if (!dragScrollTimer.Enabled) dragScrollTimer.Start();
+            }
+            else dragScrollTimer.Stop();
+        }
+
+        private void ContinueDragAutoScroll()
+        {
+            if (externalFileDrag && !NativeMethods.IsLeftMouseButtonDown())
+            {
+                CancelExternalFileDrag();
+                return;
+            }
+            if (!draggingItems && !marquee && !externalFileDrag)
+            {
+                dragScrollTimer.Stop();
+                return;
+            }
+            Point p = PointToClient(Cursor.Position);
+            bool scrolled = AutoScrollNearEdge(p);
+            if (!scrolled) return;
+            if (draggingItems || externalFileDrag) insertionIndex = InsertionFromPoint(p);
+            if (marquee) UpdateMarqueeSelection(p);
+            Invalidate();
+            Update();
+        }
+
+        private bool AutoScrollNearEdge(Point p)
+        {
+            if (!AutoScroll) return false;
+            int delta = 0;
+            if (p.Y < 0) delta = -24;
+            else if (p.Y < 30) delta = -16;
+            else if (p.Y > ClientSize.Height) delta = 24;
+            else if (p.Y > ClientSize.Height - 30) delta = 16;
+            if (delta == 0) return false;
+
+            return ScrollByPixels(delta, false);
+        }
+
+        public bool ScrollByWheel(int step)
+        {
+            int lines = SystemInformation.MouseWheelScrollLines;
+            int amount = lines < 0 ? Math.Max(Px(48), ClientSize.Height - TileH) : Math.Max(Px(32), lines * Px(16));
+            bool changed = ScrollByPixels(step * amount, true);
+            if (changed && externalFileDrag)
+            {
+                insertionIndex = InsertionFromPoint(PointToClient(Cursor.Position));
+                Invalidate();
+                Update();
+            }
+            return changed;
+        }
+
+        private bool ScrollByPixels(int delta, bool repaintNow)
+        {
+            return SetVerticalScrollPosition(-AutoScrollPosition.Y + delta, repaintNow);
+        }
+
+        private bool SetVerticalScrollPosition(int requestedY, bool repaintNow)
+        {
+            if (!AutoScroll) return false;
+
+            int currentY = -AutoScrollPosition.Y;
+            int maxY = Math.Max(0, AutoScrollMinSize.Height - ClientSize.Height);
+            int nextY = Math.Max(0, Math.Min(maxY, requestedY));
+            if (nextY == currentY) return false;
+            AutoScrollPosition = new Point(-AutoScrollPosition.X, nextY);
+            Invalidate();
+            if (repaintNow) Update();
+            return true;
+        }
+
+        private void BeginExternalFileDrag()
+        {
+            externalFileDrag = true;
+            if (externalDragWheelHook == IntPtr.Zero)
+                externalDragWheelHook = NativeMethods.InstallLowLevelMouseHook(externalDragWheelHookProc);
+        }
+
+        private void EndExternalFileDrag()
+        {
+            externalFileDrag = false;
+            if (externalDragWheelHook == IntPtr.Zero) return;
+            NativeMethods.UnhookWindowsHookEx(externalDragWheelHook);
+            externalDragWheelHook = IntPtr.Zero;
+        }
+
+        private void CancelExternalFileDrag()
+        {
+            EndExternalFileDrag();
+            insertionIndex = -1;
+            UpdateDragScrollTimer();
+            Invalidate();
+        }
+
+        private IntPtr ExternalDragWheelHookCallback(int code, IntPtr wParam, IntPtr lParam)
+        {
+            if (code >= 0 && externalFileDrag && !IsDisposed)
+            {
+                if (wParam.ToInt32() == NativeMethods.WM_LBUTTONUP)
+                {
+                    if (IsHandleCreated) try { BeginInvoke((MethodInvoker)delegate { CancelExternalFileDrag(); }); } catch { }
+                }
+                else if (wParam.ToInt32() == NativeMethods.WM_MOUSEWHEEL)
+                {
+                    NativeMethods.LowLevelMouseData data = (NativeMethods.LowLevelMouseData)Marshal.PtrToStructure(lParam, typeof(NativeMethods.LowLevelMouseData));
+                    Point screenPoint = new Point(data.X, data.Y);
+                    bool overCanvas = false;
+                    try { overCanvas = RectangleToScreen(ClientRectangle).Contains(screenPoint); } catch { }
+                    if (overCanvas)
+                    {
+                        int delta = unchecked((short)(data.MouseData >> 16));
+                        if (delta != 0 && IsHandleCreated)
+                        {
+                            try { BeginInvoke((MethodInvoker)delegate { ScrollByWheel(delta > 0 ? -1 : 1); }); } catch { }
+                            return (IntPtr)1;
+                        }
+                    }
+                }
+            }
+            return NativeMethods.CallNextHookEx(externalDragWheelHook, code, wParam, lParam);
         }
 
         private void QueueThumbnail(FileItem item)
@@ -2158,6 +2534,11 @@ namespace FileOrderTimeTool
             int delta = unchecked((short)((long)message.WParam >> 16));
             if (delta == 0) return false;
             int step = delta > 0 ? -1 : 1;
+            if (canvas.ExternalFileDragActive && PointerOver(canvas, Control.MousePosition))
+            {
+                canvas.ScrollByWheel(step);
+                return true;
+            }
             bool controlDown = (Control.ModifierKeys & Keys.Control) == Keys.Control;
             return HandleMouseWheelAt(Control.MousePosition, step, controlDown);
         }
@@ -2344,6 +2725,8 @@ namespace FileOrderTimeTool
             else if (action == ShortcutIds.RedoDisk) RedoDiskChange();
             else if (action == ShortcutIds.MoveLeft) canvas.MoveSelectedOne(true);
             else if (action == ShortcutIds.MoveRight) canvas.MoveSelectedOne(false);
+            else if (action == ShortcutIds.MoveUp) canvas.MoveSelectedRow(true);
+            else if (action == ShortcutIds.MoveDown) canvas.MoveSelectedRow(false);
             else if (action == ShortcutIds.MoveFront) canvas.MoveSelected(true);
             else if (action == ShortcutIds.MoveEnd) canvas.MoveSelected(false);
             else if (action == ShortcutIds.PrevSort) CycleSort(-1);
@@ -3141,8 +3524,38 @@ namespace FileOrderTimeTool
                     ShortcutBinding b = ShortcutBinding.Parse(d[key]);
                     if (b != null) shortcuts[id] = b;
                 }
+
+                // v1.8.5.2 adds independent one-row movement. Older settings files
+                // always contain the previous defaults (Up/Down for front/end), so
+                // migrate only those exact defaults and leave genuine custom keys intact.
+                bool hasMoveUpSetting = d.ContainsKey("Shortcut_" + ShortcutIds.MoveUp);
+                bool hasMoveDownSetting = d.ContainsKey("Shortcut_" + ShortcutIds.MoveDown);
+                ShortcutBinding oldFront;
+                if (!hasMoveUpSetting && shortcuts.TryGetValue(ShortcutIds.MoveFront, out oldFront) &&
+                    oldFront != null && oldFront.KeyCode == Keys.Up && oldFront.Modifiers == Keys.None && !oldFront.TabPrefix)
+                    shortcuts[ShortcutIds.MoveFront] = new ShortcutBinding { KeyCode = Keys.Up, Modifiers = Keys.Control };
+                ShortcutBinding oldEnd;
+                if (!hasMoveDownSetting && shortcuts.TryGetValue(ShortcutIds.MoveEnd, out oldEnd) &&
+                    oldEnd != null && oldEnd.KeyCode == Keys.Down && oldEnd.Modifiers == Keys.None && !oldEnd.TabPrefix)
+                    shortcuts[ShortcutIds.MoveEnd] = new ShortcutBinding { KeyCode = Keys.Down, Modifiers = Keys.Control };
+
+                if (!hasMoveUpSetting && ShortcutIsUsedByAnother(ShortcutIds.MoveUp, Keys.Up, Keys.None, false))
+                    shortcuts[ShortcutIds.MoveUp] = null;
+                if (!hasMoveDownSetting && ShortcutIsUsedByAnother(ShortcutIds.MoveDown, Keys.Down, Keys.None, false))
+                    shortcuts[ShortcutIds.MoveDown] = null;
             }
             catch { }
+        }
+
+        private bool ShortcutIsUsedByAnother(string exceptId, Keys key, Keys modifiers, bool tabPrefix)
+        {
+            foreach (KeyValuePair<string, ShortcutBinding> pair in shortcuts)
+            {
+                ShortcutBinding b = pair.Value;
+                if (pair.Key == exceptId || b == null) continue;
+                if (b.KeyCode == key && b.Modifiers == modifiers && b.TabPrefix == tabPrefix) return true;
+            }
+            return false;
         }
 
         private void SaveSettings()
@@ -3191,18 +3604,18 @@ namespace FileOrderTimeTool
             UiText.HelpApplicationQuestion + "\r\n\r\n" + UiText.HelpFirstQuestion + "\r\n\r\n问：什么是“最晚日期”和“间隔”？\r\n答：本工具先确定整组文件中最新的日期，再按照间隔逐个向前计算其他文件的日期。\r\n\r\n问：“文件的最晚日期”读取哪一种日期？\r\n答：“修改模式：修改日期”时读取全部导入文件中最新的修改日期；切换到创建日期时读取最新的创建日期。\r\n\r\n问：“当前时间”是什么？\r\n答：它是点击“预览”或“应用更改”时电脑显示的本地时间。预览与实际应用之间如果间隔较久，应用时会重新读取当前时间。\r\n\r\n问：选择文件会影响哪些操作？\r\n答：“更改文件日期”始终处理全部导入文件。文件名和扩展名重命名在有选择时只处理选中文件，没有选择时处理全部文件。",
             "1. 把文件从资源管理器直接拖入主窗口。\r\n\r\n2. 使用排序、移动按钮或拖动卡片调整视觉顺序。\r\n\r\n3. 勾选需要的功能：更改文件日期、更改扩展名或批量重命名。\r\n\r\n4. 更改日期时选择修改模式、最晚日期来源和间隔。\r\n\r\n5. 先点“预览”核对，再点“应用更改”。",
             "只接受文件；文件夹会被忽略，重复文件不会再次加入。图片和视频缩略图由 Windows 提供。\r\n\r\n双击图片会在程序内部打开大图。使用 ← / → 或窗口底部按钮，按照主界面当前视觉顺序切换图片；视频和其他文件仍由系统默认程序打开。\r\n\r\n文件名最多显示两行，悬停卡片可以查看完整文件名。Delete 只从工具列表移除，不删除磁盘文件。",
-            "单击：只选一个。\r\nCtrl+单击：追加或取消选择。\r\nShift+单击：连续选择。\r\n空白处拖动：框选。\r\nCtrl+A：全选。\r\n右键缩略图区：取消全部选择。\r\n\r\n拖动一个或多个已选文件时，蓝色插入线表示整组最终位置。“移到最前”和“移到最后”会保留选中组内部的顺序。",
+            "单击：只选一个。\r\nCtrl+单击：追加或取消选择。\r\nShift+单击：连续选择。\r\n空白处拖动：框选。\r\nCtrl+A：全选。\r\n右键缩略图区：取消全部选择。\r\n\r\n拖动一个或多个已选文件时，蓝色插入线表示整组最终位置。鼠标停在文件区上方或下方时会持续自动滚动。“移到最前”和“移到最后”会保留选中组内部的顺序。\r\n\r\n从资源管理器拖入的新文件也会显示蓝色插入线，可直接插入指定位置；拖到末尾空白处则添加到最后。多选文件会保持资源管理器中的原顺序，不会因鼠标从其中某个文件开始拖动而循环移位。拖入过程中保持左键按下时，也可以使用鼠标滚轮浏览文件区域；鼠标停在文件区上方或下方时会持续自动滚动。",
             "排序框只负责选择排序依据和升降序，不会持续限制文件顺序。选择后需要点击右侧“✓”执行一次排序；排序完成后，仍可继续拖动或使用移动按钮自定义排列。\r\n\r\n排序菜单的分隔线上方是文件名、修改日期、创建日期、文件大小和文件类型；下方是升序和降序。圆点表示当前依据和方向。\r\n\r\n鼠标位于排序框时，滚轮切换排序依据，Ctrl+滚轮切换升降序。使用快捷键 Tab+↑/↓ 可直接切换排序依据，Ctrl+Tab+↑/↓ 可直接切换升降序。\r\n\r\n有选择时，排序会整理选中文件并把它们聚到最前；没有选择时处理全部文件。第二排其他图标依次为移到最前、移到最后、移除、撤销和重做；最右侧两个带文件标记的图标用于撤销更改和重做更改。",
             "“修改模式：修改日期/创建日期”决定要写入哪一种 Windows 文件日期，升序/降序决定日期排列方向。“更改文件日期”始终处理全部导入文件。\r\n\r\n鼠标位于修改模式框时，滚轮切换日期类型，Ctrl+滚轮切换升降序。降序表示左上第一个文件日期最新，升序表示右下最后一个文件日期最新。\r\n\r\n最晚日期来源包括“文件的最晚日期”“当前时间”和“自定义”，可用滚轮切换。自定义状态点击日期部分可编辑，点击右侧箭头可打开菜单。",
             "扩展名：勾选“更改扩展名”，输入 jpg 或 .jpg 均可。扩展名输入框为空时不会执行，也不会删除原扩展名。\r\n\r\n文件名：勾选“批量重命名”，输入名称，框选其中一段纯数字，再点“设置递增”。例如框选“旅行照片1”中的“1”，会生成旅行照片1至旅行照片9，然后生成旅行照片10、旅行照片11……；框选“旅行照片01”中的“01”，则会生成旅行照片01至旅行照片09，然后生成旅行照片10、旅行照片11……。原数字位数只是编号的最少位数，超过该位数时会自然增加，不会截断。\r\n\r\n两项可以单独或同时使用。程序会在执行前检查重名和已有文件，绝不会覆盖。",
             "“预览”只显示计划结果，不会写入文件。表格会显示最终文件名以及所选的修改日期或创建日期。\r\n\r\n“应用更改”可以一次完成日期、文件名和扩展名操作。确认窗口默认选中“确定”，直接按 Enter 可以继续。\r\n\r\n执行前会检查路径、文件标识、修改日期、创建日期和目标名称；发现外部变化或冲突时停止。",
             "“撤销/重做”只处理主界面中的排列操作。\r\n\r\n“撤销更改/重做更改”处理已经写入磁盘的日期、文件名和扩展名，并在本次运行期间保留多级历史。新的磁盘操作会清空磁盘重做记录。\r\n\r\n如果文件在程序外被移动、改名或改变日期，安全检查会停止操作。",
-            "Delete：移除选中\r\nEnter：排序选中/全部\r\nCtrl+Z：撤销界面\r\nCtrl+Shift+Z：重做界面\r\nShift+Enter：应用更改\r\nAlt+Enter：预览\r\nCtrl+Alt+Z：撤销磁盘更改\r\nCtrl+Shift+Alt+Z：重做磁盘更改\r\n← / →：整组选中文件向前/后移动\r\n↑ / ↓：移到最前/最后\r\nTab+↑ / ↓：切换排序依据\r\nCtrl+Tab+↑ / ↓：切换升序/降序\r\nF1：使用说明\r\n\r\n程序首次运行时自动打开本说明，以后可用 F1 或“？”再次打开。程序只允许一个实例，并会记住窗口尺寸而不记住窗口位置。"
+            "Delete：移除选中\r\nEnter：排序选中/全部\r\nCtrl+Z：撤销界面\r\nCtrl+Shift+Z：重做界面\r\nShift+Enter：应用更改\r\nAlt+Enter：预览\r\nCtrl+Alt+Z：撤销磁盘更改\r\nCtrl+Shift+Alt+Z：重做磁盘更改\r\n← / →：整组选中文件向左/右移动\r\n↑ / ↓：整组选中文件上移/下移一行\r\nCtrl+↑ / ↓：移到最前/最后\r\nTab+↑ / ↓：切换排序依据\r\nCtrl+Tab+↑ / ↓：切换升序/降序\r\nF1：使用说明\r\n\r\n程序首次运行时自动打开本说明，以后可用 F1 或“？”再次打开。程序只允许一个实例，并会记住窗口尺寸而不记住窗口位置。"
         };
 
         public HelpForm()
         {
-            Text = "使用说明 - 批量文件排序/重命名工具 v1.8.4.5 测试版";
+            Text = "使用说明 - 批量文件排序/重命名工具 v1.8.5.3 测试版";
             ClientSize = new Size(760, 540);
             MinimumSize = new Size(620, 440);
             StartPosition = FormStartPosition.CenterParent;
@@ -3714,11 +4127,210 @@ namespace FileOrderTimeTool
         }
     }
 
+    // Explorer puts the focused (dragged) file first in CF_HDROP. Ask the
+    // source folder view for its selection in display order instead.
+    static class ExplorerSelectionOrder
+    {
+        private const uint SelectedInViewOrder = 0x80000001;
+
+        public static string[] TryGetViewOrder(string[] draggedFiles)
+        {
+            if (draggedFiles == null || draggedFiles.Length < 2) return null;
+            HashSet<string> expected = new HashSet<string>(draggedFiles.Select(Path.GetFullPath),
+                StringComparer.OrdinalIgnoreCase);
+            if (expected.Count != draggedFiles.Length) return null;
+
+            object shell = null, windows = null;
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("Shell.Application");
+                if (shellType == null) return null;
+                shell = Activator.CreateInstance(shellType);
+                windows = Invoke(shell, "Windows", BindingFlags.InvokeMethod);
+                int count = Convert.ToInt32(Invoke(windows, "Count", BindingFlags.GetProperty));
+                for (int i = 0; i < count; i++)
+                {
+                    object window = null;
+                    try
+                    {
+                        window = Invoke(windows, "Item", BindingFlags.InvokeMethod, i);
+                        IServiceProvider serviceProvider = window as IServiceProvider;
+                        if (serviceProvider == null) continue;
+                        Guid service = new Guid("4C96BE40-915C-11CF-99D3-00AA004AE837");
+                        Guid browserId = typeof(IShellBrowser).GUID;
+                        IShellBrowser browser = serviceProvider.QueryService(ref service, ref browserId) as IShellBrowser;
+                        if (browser == null) continue;
+                        IShellView view = browser.QueryActiveShellView();
+                        if (view == null) continue;
+                        Guid arrayId = typeof(IShellItemArray).GUID;
+                        IShellItemArray items = view.GetItemObject(SelectedInViewOrder, ref arrayId) as IShellItemArray;
+                        if (items == null) continue;
+                        uint itemCount;
+                        items.GetCount(out itemCount);
+                        if (itemCount != draggedFiles.Length) continue;
+                        List<string> ordered = new List<string>((int)itemCount);
+                        for (uint j = 0; j < itemCount; j++)
+                        {
+                            IShellItem item;
+                            items.GetItemAt(j, out item);
+                            IntPtr name = IntPtr.Zero;
+                            try
+                            {
+                                item.GetDisplayName(0x80058000, out name); // SIGDN_FILESYSPATH
+                                ordered.Add(Marshal.PtrToStringUni(name));
+                            }
+                            finally
+                            {
+                                if (name != IntPtr.Zero) Marshal.FreeCoTaskMem(name);
+                            }
+                        }
+                        if (ordered.Count == expected.Count &&
+                            ordered.All(path => !string.IsNullOrEmpty(path) && expected.Contains(Path.GetFullPath(path))) &&
+                            new HashSet<string>(ordered, StringComparer.OrdinalIgnoreCase).Count == expected.Count)
+                            return ordered.ToArray();
+                    }
+                    catch (COMException) { }
+                    catch (InvalidCastException) { }
+                    finally
+                    {
+                        if (window != null && Marshal.IsComObject(window)) Marshal.ReleaseComObject(window);
+                    }
+                }
+            }
+            catch (COMException) { }
+            catch (TargetInvocationException) { }
+            catch (InvalidCastException) { }
+            catch (ArgumentException) { }
+            finally
+            {
+                if (windows != null && Marshal.IsComObject(windows)) Marshal.ReleaseComObject(windows);
+                if (shell != null && Marshal.IsComObject(shell)) Marshal.ReleaseComObject(shell);
+            }
+            return null;
+        }
+
+        private static object Invoke(object target, string member, BindingFlags flags, params object[] args)
+        {
+            return target.GetType().InvokeMember(member, flags, null, target, args);
+        }
+
+        [ComImport, Guid("6D5140C1-7436-11CE-8034-00AA006009FA"),
+         InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IServiceProvider
+        {
+            [return: MarshalAs(UnmanagedType.Interface)]
+            object QueryService(ref Guid service, ref Guid iid);
+        }
+
+        [ComImport, Guid("000214E2-0000-0000-C000-000000000046"),
+         InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IShellBrowser
+        {
+            void VTableGap01(); void VTableGap02(); void VTableGap03();
+            void VTableGap04(); void VTableGap05(); void VTableGap06();
+            void VTableGap07(); void VTableGap08(); void VTableGap09();
+            void VTableGap10(); void VTableGap11(); void VTableGap12();
+            IShellView QueryActiveShellView();
+        }
+
+        [ComImport, Guid("000214E3-0000-0000-C000-000000000046"),
+         InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IShellView
+        {
+            void VTableGap01(); void VTableGap02(); void VTableGap03();
+            void VTableGap04(); void VTableGap05(); void VTableGap06();
+            void VTableGap07(); void VTableGap08(); void VTableGap09();
+            void VTableGap10(); void VTableGap11(); void VTableGap12();
+            [return: MarshalAs(UnmanagedType.Interface)]
+            object GetItemObject(uint aspect, ref Guid iid);
+        }
+
+        [ComImport, Guid("B63EA76D-1F85-456F-A19C-48159EFA858B"),
+         InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IShellItemArray
+        {
+            void VTableGap01(); void VTableGap02(); void VTableGap03();
+            void VTableGap04();
+            void GetCount(out uint count);
+            void GetItemAt(uint index, out IShellItem item);
+        }
+
+        [ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"),
+         InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IShellItem
+        {
+            void VTableGap01(); void VTableGap02();
+            void GetDisplayName(uint nameType, out IntPtr name);
+        }
+    }
+
     static class NativeMethods
     {
         private const int SW_RESTORE = 9;
         private const int EM_SETMARGINS = 0x00D3;
         private const int EC_LEFTMARGIN = 0x0001;
+        public const int WM_VSCROLL = 0x0115;
+        public const int WM_LBUTTONUP = 0x0202;
+        public const int WM_MOUSEWHEEL = 0x020A;
+        public const int SB_THUMBTRACK = 5;
+        private const int SB_VERT = 1;
+        private const uint SIF_TRACKPOS = 0x0010;
+        private const int WH_MOUSE_LL = 14;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ScrollInfo
+        {
+            public uint Size;
+            public uint Mask;
+            public int Min;
+            public int Max;
+            public uint Page;
+            public int Position;
+            public int TrackPosition;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LowLevelMouseData
+        {
+            public int X;
+            public int Y;
+            public uint MouseData;
+            public uint Flags;
+            public uint Time;
+            public UIntPtr ExtraInfo;
+        }
+
+        public delegate IntPtr LowLevelMouseProc(int code, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetScrollInfo(IntPtr window, int bar, ref ScrollInfo info);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int hookId, LowLevelMouseProc callback, IntPtr module, uint threadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UnhookWindowsHookEx(IntPtr hook);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string moduleName);
+
+        public static bool TryGetVerticalTrackPosition(IntPtr window, out int position)
+        {
+            ScrollInfo info = new ScrollInfo();
+            info.Size = (uint)Marshal.SizeOf(typeof(ScrollInfo));
+            info.Mask = SIF_TRACKPOS;
+            bool ok = GetScrollInfo(window, SB_VERT, ref info);
+            position = info.TrackPosition;
+            return ok;
+        }
+
+        public static IntPtr InstallLowLevelMouseHook(LowLevelMouseProc callback)
+        {
+            return SetWindowsHookEx(WH_MOUSE_LL, callback, GetModuleHandle(null), 0);
+        }
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
@@ -3732,6 +4344,11 @@ namespace FileOrderTimeTool
 
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
+
+        public static bool IsLeftMouseButtonDown()
+        {
+            return (GetAsyncKeyState(0x01) & 0x8000) != 0;
+        }
 
         [DllImport("user32.dll")]
         private static extern bool IsIconic(IntPtr window);
